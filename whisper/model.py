@@ -64,23 +64,41 @@ class MultiHeadAttention(nn.Module):
         self.out = Linear(n_state, n_state)
 
     def forward(
-        self,
-        x: Tensor,
-        xa: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+            self,
+            x: Tensor,
+            xa: Optional[Tensor] = None,
+            mask: Optional[Tensor] = None,
+            kv_cache: Optional[dict] = None,
     ):
         q = self.query(x)
 
-        if kv_cache is None or xa is None or self.key not in kv_cache:
-            # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
-            # otherwise, perform key/value projections for self- or cross-attention as usual.
-            k = self.key(x if xa is None else xa)
-            v = self.value(x if xa is None else xa)
+        if kv_cache is None:  # encoder
+            k, v = self.key(x), self.value(x)
         else:
-            # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+            if self.key not in kv_cache:
+                k, v = self.key(x if xa is None else xa), self.value(x if xa is None else xa)
+                kv_cache[self.key] = k
+                kv_cache[self.value] = v
+            else:
+                if xa is not None:
+                    k, v = kv_cache[self.key], kv_cache[self.value]
+                else:
+                    k, v = self.key(x), self.value(x)
+                    k = torch.cat([kv_cache[self.key], k], dim=1).detach()
+                    v = torch.cat([kv_cache[self.value], v], dim=1).detach()
+                    kv_cache[self.key] = k
+                    kv_cache[self.value] = v
+
+        # if kv_cache is None or xa is None or self.key not in kv_cache:
+        #     # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
+        #     # otherwise, perform key/value projections for self- or cross-attention as usual.
+        #     k = self.key(x if xa is None else xa)
+        #     v = self.value(x if xa is None else xa)
+        #
+        # else:
+        #     # for cross-attention, calculate keys and values once and reuse in subsequent calls.
+        #     k = kv_cache[self.key]
+        #     v = kv_cache[self.value]
 
         wv = self.qkv_attention(q, k, v, mask)
         return self.out(wv)
@@ -115,11 +133,11 @@ class ResidualAttentionBlock(nn.Module):
         self.mlp_ln = LayerNorm(n_state)
 
     def forward(
-        self,
-        x: Tensor,
-        xa: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+            self,
+            x: Tensor,
+            xa: Optional[Tensor] = None,
+            mask: Optional[Tensor] = None,
+            kv_cache: Optional[dict] = None,
     ):
         x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
         if self.cross_attn:
@@ -182,7 +200,7 @@ class TextDecoder(nn.Module):
             the encoded audio features to be attended on
         """
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
-        x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
+        x = self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]]
         x = x.to(xa.dtype)
 
         for block in self.blocks:
@@ -229,38 +247,6 @@ class Whisper(nn.Module):
     @property
     def is_multilingual(self):
         return self.dims.n_vocab == 51865
-
-    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
-        """
-        The `MultiHeadAttention` module optionally accepts `kv_cache` which stores the key and value
-        tensors calculated for the previous positions. This method returns a dictionary that stores
-        all caches, and the necessary hooks for the key and value projection modules that save the
-        intermediate tensors to be reused during later calculations.
-
-        Returns
-        -------
-        cache : Dict[nn.Module, torch.Tensor]
-            A dictionary object mapping the key/value projection modules to its cache
-        hooks : List[RemovableHandle]
-            List of PyTorch RemovableHandle objects to stop the hooks to be called
-        """
-        cache = {**cache} if cache is not None else {}
-        hooks = []
-
-        def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.decoder.positional_embedding.shape[0]:
-                cache[module] = output  # save as-is, for the first token or cross attention
-            else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
-            return cache[module]
-
-        def install_hooks(layer: nn.Module):
-            if isinstance(layer, MultiHeadAttention):
-                hooks.append(layer.key.register_forward_hook(save_to_cache))
-                hooks.append(layer.value.register_forward_hook(save_to_cache))
-
-        self.decoder.apply(install_hooks)
-        return cache, hooks
 
     detect_language = detect_language_function
     transcribe = transcribe_function
